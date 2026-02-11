@@ -47,22 +47,28 @@ Deploys using Helm - Waits for rollout completion
 
 ------------------------------------------------------------------------
 
+# Spring Boot CI/CD to EKS (Azure DevOps + ECR + Helm + Cosign + AWS KMS)
+
 ## Cosign + AWS KMS
 
 Only the KMS alias is defined in the pipeline:
 
 cosignKmsAlias: cosign-key
 
-At runtime, the pipeline builds:
+At runtime, the pipeline dynamically builds the full KMS URI:
 
-awskms:///arn:aws:kms:`<region>`{=html}:`<account-id>`{=html}:alias/`<alias>`{=html}
+`awskms:///arn:aws:kms:<region>:<account-id>:alias/<alias>`
 
-Signing: cosign sign --key `<KMS_URI>`{=html} `<IMAGE_REF>`{=html}
+### Signing
 
-Verification: cosign verify --key `<KMS_URI>`{=html}
-`<IMAGE_REF>`{=html}
+    cosign sign --yes --key <KMS_URI> <IMAGE_REF>
 
-No private keys are stored in Azure DevOps.
+### Verification
+
+    cosign verify --key <KMS_URI> <IMAGE_REF>
+
+No private keys are stored in Azure DevOps.\
+All cryptographic operations are delegated to AWS KMS.
 
 ------------------------------------------------------------------------
 
