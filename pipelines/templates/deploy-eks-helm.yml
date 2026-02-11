@@ -1,0 +1,88 @@
+parameters:
+  stageName: ""
+  dependsOn: []
+
+  environmentName: ""
+
+  awsEcrServiceConnection: ""
+  awsEksServiceConnection: ""
+  awsRegion: ""
+
+  eksClusterName: ""
+  namespace: ""
+
+  appName: ""
+  helmChartPath: ""
+
+  cosignKmsAlias: ""
+
+stages:
+- stage: ${{ parameters.stageName }}
+  displayName: Deploy ${{ parameters.environmentName }}
+  dependsOn: ${{ parameters.dependsOn }}
+
+  jobs:
+  - deployment: ${{ parameters.environmentName }}
+    displayName: Deploy to ${{ parameters.environmentName }}
+    environment: ${{ parameters.environmentName }}
+    pool:
+      vmImage: ubuntu-latest
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - download: current
+            artifact: image_ref
+
+          - bash: scripts/install_tools.sh
+            displayName: Install tools
+
+          # Verify signature using KMS (ECR role)
+          - task: AWSShellScript@1
+            displayName: Cosign verify with AWS KMS
+            inputs:
+              awsCredentials: ${{ parameters.awsEcrServiceConnection }}
+              regionName: ${{ parameters.awsRegion }}
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+
+                ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+                KMS_KEY_URI="awskms:///arn:aws:kms:${{ parameters.awsRegion }}:${ACCOUNT_ID}:alias/${{ parameters.cosignKmsAlias }}"
+
+                IMAGE_REF="$(cat $(Pipeline.Workspace)/image_ref/image-ref.txt)"
+
+                echo "Verifying signature with key: $KMS_KEY_URI"
+                cosign verify --key "$KMS_KEY_URI" "$IMAGE_REF"
+
+          # Configure kubeconfig with environment role
+          - task: AWSShellScript@1
+            displayName: Configure kubeconfig (EKS)
+            inputs:
+              awsCredentials: ${{ parameters.awsEksServiceConnection }}
+              regionName: ${{ parameters.awsRegion }}
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                aws eks update-kubeconfig \
+                  --name "${{ parameters.eksClusterName }}" \
+                  --kubeconfig "$(Pipeline.Workspace)/kubeconfig"
+
+          - bash: |
+              set -euo pipefail
+              export KUBECONFIG="$(Pipeline.Workspace)/kubeconfig"
+
+              IMAGE_REF="$(cat $(Pipeline.Workspace)/image_ref/image-ref.txt)"
+              REPO="$(echo "$IMAGE_REF" | cut -d@ -f1)"
+              DIGEST="$(echo "$IMAGE_REF" | cut -d@ -f2)"
+
+              helm upgrade --install "${{ parameters.appName }}" "${{ parameters.helmChartPath }}" \
+                --namespace "${{ parameters.namespace }}" --create-namespace \
+                --set image.repository="$REPO" \
+                --set image.digest="$DIGEST"
+
+              kubectl -n "${{ parameters.namespace }}" rollout status deploy/${{ parameters.appName }} --timeout=180s
+            displayName: Helm deploy

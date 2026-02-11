@@ -1,0 +1,149 @@
+trigger:
+- main
+
+variables:
+  awsRegion: eu-west-1
+  ecrRepo: springboot
+
+  appName: springboot
+  helmChartPath: helm/springboot
+
+  namespaceDev: dev
+  namespaceStaging: staging
+  namespaceProd: prod
+
+  eksClusterDev: eks-dev
+  eksClusterStaging: eks-staging
+  eksClusterProd: eks-prod
+
+  # AWS Service Connections
+  awsConnEcr: aws-ecr-central-conn
+  awsConnDev: aws-dev-conn
+  awsConnStaging: aws-staging-conn
+  awsConnProd: aws-prod-conn
+
+  # Only alias, ARN will be built dynamically
+  cosignKmsAlias: cosign-key
+
+stages:
+
+# =========================================================
+# BUILD + SCAN + PUSH + SIGN
+# =========================================================
+- stage: Build_Scan_Push_Sign
+  displayName: Build, Scan, Push to ECR, Sign (KMS)
+  jobs:
+  - job: build
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+    - checkout: self
+
+    - bash: scripts/install_tools.sh
+      displayName: Install tools
+
+    - task: AWSShellScript@1
+      displayName: Build, Scan, Push, Capture Digest
+      inputs:
+        awsCredentials: $(awsConnEcr)
+        regionName: $(awsRegion)
+        scriptType: inline
+        inlineScript: |
+          set -euo pipefail
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.$(awsRegion).amazonaws.com"
+          IMAGE="${REGISTRY}/$(ecrRepo)"
+
+          SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-7)
+          TAG="$(Build.BuildId)-$SHORT_SHA"
+
+          echo "Registry: $REGISTRY"
+          echo "Image:    $IMAGE"
+          echo "Tag:      $TAG"
+
+          aws ecr get-login-password --region "$(awsRegion)" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+
+          docker build -t "$IMAGE:$TAG" .
+          scripts/scan_trivy.sh "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+
+          IMAGE_REF="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$TAG")"
+          echo "$IMAGE_REF" > image-ref.txt
+
+          echo "Image ref: $IMAGE_REF"
+
+    - task: AWSShellScript@1
+      displayName: Cosign sign with AWS KMS
+      inputs:
+        awsCredentials: $(awsConnEcr)
+        regionName: $(awsRegion)
+        scriptType: inline
+        inlineScript: |
+          set -euo pipefail
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          KMS_KEY_URI="awskms:///arn:aws:kms:$(awsRegion):${ACCOUNT_ID}:alias/$(cosignKmsAlias)"
+
+          IMAGE_REF="$(cat image-ref.txt)"
+
+          echo "Signing with KMS key: $KMS_KEY_URI"
+          cosign sign --yes --key "$KMS_KEY_URI" "$IMAGE_REF"
+
+    - publish: image-ref.txt
+      artifact: image_ref
+      displayName: Publish image ref
+
+
+# =========================================================
+# DEV
+# =========================================================
+- template: pipelines/templates/deploy-eks-helm.yml
+  parameters:
+    stageName: Deploy_Dev
+    dependsOn: [Build_Scan_Push_Sign]
+    environmentName: dev
+    awsEcrServiceConnection: $(awsConnEcr)
+    awsEksServiceConnection: $(awsConnDev)
+    awsRegion: $(awsRegion)
+    eksClusterName: $(eksClusterDev)
+    namespace: $(namespaceDev)
+    appName: $(appName)
+    helmChartPath: $(helmChartPath)
+    cosignKmsAlias: $(cosignKmsAlias)
+
+# =========================================================
+# STAGING
+# =========================================================
+- template: pipelines/templates/deploy-eks-helm.yml
+  parameters:
+    stageName: Deploy_Staging
+    dependsOn: [Deploy_Dev]
+    environmentName: staging
+    awsEcrServiceConnection: $(awsConnEcr)
+    awsEksServiceConnection: $(awsConnStaging)
+    awsRegion: $(awsRegion)
+    eksClusterName: $(eksClusterStaging)
+    namespace: $(namespaceStaging)
+    appName: $(appName)
+    helmChartPath: $(helmChartPath)
+    cosignKmsAlias: $(cosignKmsAlias)
+
+# =========================================================
+# PROD
+# =========================================================
+- template: pipelines/templates/deploy-eks-helm.yml
+  parameters:
+    stageName: Deploy_Prod
+    dependsOn: [Deploy_Staging]
+    environmentName: prod
+    awsEcrServiceConnection: $(awsConnEcr)
+    awsEksServiceConnection: $(awsConnProd)
+    awsRegion: $(awsRegion)
+    eksClusterName: $(eksClusterProd)
+    namespace: $(namespaceProd)
+    appName: $(appName)
+    helmChartPath: $(helmChartPath)
+    cosignKmsAlias: $(cosignKmsAlias)
